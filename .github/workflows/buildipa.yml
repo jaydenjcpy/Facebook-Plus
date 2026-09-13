@@ -1,0 +1,102 @@
+name: Build IPA
+
+on:
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - ".gitignore"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - ".gitignore"
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "Direct link to a decrypted Facebook .ipa (leave empty to only build the .deb)"
+        required: false
+        type: string
+        default: ""
+
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build tweak (.deb)
+
+    runs-on: macos-latest
+    env:
+      THEOS: ${{ github.workspace }}/theos
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Theos build dependencies
+        run: brew install ldid dpkg xz
+
+      - name: Set up Theos
+        run: git clone --quiet --recursive https://github.com/theos/theos.git "$THEOS"
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Upload built packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: Facebook-Plus
+          path: packages/Facebook-Plus-v*.deb
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Install injection tool (cyan)
+        if: inputs.ipa_url != ''
+        run: |
+          python3 -m pip install --disable-pip-version-check cyan \
+            || python3 -m pip install --disable-pip-version-check --break-system-packages cyan
+
+      - name: Download decrypted IPA
+        if: inputs.ipa_url != ''
+        env:
+          IPA_URL: ${{ inputs.ipa_url }}
+        run: |
+          echo "Fetching decrypted IPA from provided link…"
+          curl --fail --location --connect-timeout 30 --retry 3 --retry-delay 5 \
+            --output decrypted.ipa "$IPA_URL"
+          # Sanity check: an .ipa is just a zip archive.
+          unzip -t decrypted.ipa > /dev/null
+          echo "Downloaded $(du -h decrypted.ipa | cut -f1)"
+
+      - name: Inject tweak into IPA
+        if: inputs.ipa_url != ''
+        run: |
+          # Pick the .deb that was just built (newest, in case several exist).
+          DEB=$(ls -t packages/Facebook-Plus-v*.deb | head -n1)
+          echo "Injecting ${DEB} into decrypted.ipa…"
+          # -t = tweak (.deb or .dylib), -c = ad-hoc (fake) re-sign the app so
+          # the modified binary is installable / re-signable (AltStore,
+          # Sideloadly, TrollStore, etc.).
+          cyan -i decrypted.ipa -t "$DEB" -o Facebook-Plus.ipa -c
+
+      - name: Upload patched IPA
+        if: inputs.ipa_url != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: Facebook-Plus-IPA
+          path: Facebook-Plus.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Job summary
+        if: inputs.ipa_url != ''
+        run: |
+          echo "## ✅ Patched IPA built" >> "$GITHUB_STEP_SUMMARY"
+          echo "The tweak was injected into the provided decrypted IPA. Download **Facebook-Plus-IPA** from this run's artifacts." >> "$GITHUB_STEP_SUMMARY"
