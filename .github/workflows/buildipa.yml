@@ -1,11 +1,11 @@
-name: Build
+name: Build IPA or tweak 
 
 # Verify the tweak compiles on every pull request and push to main by running
 # the project's own build.sh.
 #
 # CI ships no decrypted Facebook IPA (it cannot, for legal reasons), so build.sh
-# builds the .deb and skips the cyan injection step. The check therefore verifies
-# that the package compiles cleanly; injection tooling (cyan) is not needed here.
+# builds the .deb and skips the injection step. The check therefore verifies
+# that the package compiles cleanly.
 #
 # Optional manual runs (workflow_dispatch):
 #   Provide a direct link to a *decrypted* Facebook .ipa and the workflow will
@@ -76,21 +76,20 @@ jobs:
       # decrypted IPA. Only runs on workflow_dispatch when a URL was given;
       # push/PR runs just build the .deb.
       # ---------------------------------------------------------------------
-      - name: Install injection tool (cyan)
+      - name: Install injection tool (Azule)
         if: inputs.ipa_url != ''
         run: |
-          python3 -m pip install --disable-pip-version-check --upgrade cyan \
-            || python3 -m pip install --disable-pip-version-check --upgrade --break-system-packages cyan
-
-          # pip frequently installs console scripts outside PATH on the macOS
-          # runners (user site-packages fallback). Export those dirs for the
-          # steps that follow via $GITHUB_PATH.
-          USER_BIN="$(python3 -m site --user-base)/bin"
-          for d in "$USER_BIN" "$HOME/.local/bin" /usr/local/bin /opt/homebrew/bin; do
-            if [ -x "$d/cyan" ]; then
-              echo "$d" >> "$GITHUB_PATH"
-            fi
-          done
+          # Azule (Al4ise/Azule) is the standard CLI injector: it accepts the
+          # .deb directly, copies the dylib + filter plist into the app,
+          # patches the Mach-O load commands, and fake-signs with ldid.
+          # NOTE: the `cyan` package on PyPI is an unrelated project-template
+          # package with no executable — do not use it.
+          if ! brew install azule; then
+            echo "Homebrew formula unavailable — falling back to source install…"
+            git clone --quiet --depth 1 https://github.com/Al4ise/Azule.git "$HOME/Azule"
+            chmod +x "$HOME/Azule/Azule"
+            echo "$HOME/Azule" >> "$GITHUB_PATH"
+          fi
 
       - name: Download decrypted IPA
         if: inputs.ipa_url != ''
@@ -109,35 +108,25 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Resolve the cyan executable no matter where pip dropped it.
-          if ! command -v cyan >/dev/null 2>&1; then
-            for d in \
-              "$(python3 -m site --user-base)/bin" \
-              "$HOME/.local/bin" \
-              /usr/local/bin \
-              /opt/homebrew/bin; do
-              if [ -x "$d/cyan" ]; then
-                export PATH="$d:$PATH"
-                break
-              fi
-            done
-          fi
-
-          if ! command -v cyan >/dev/null 2>&1; then
-            echo "::error::'cyan' executable not found after installation. Installed package files:"
-            python3 -m pip show -f cyan || true
+          # Resolve the injector (brew installs it as `azule`; the source
+          # checkout ships an executable named `Azule`).
+          if command -v azule >/dev/null 2>&1; then
+            AZULE="$(command -v azule)"
+          elif [ -x "$HOME/Azule/Azule" ]; then
+            AZULE="$HOME/Azule/Azule"
+          else
+            echo "::error::Azule not found after installation"
             exit 1
           fi
-
-          echo "Using cyan at: $(command -v cyan)"
+          echo "Using injector: $AZULE"
 
           # Pick the .deb that was just built (newest, in case several exist).
           DEB="$(ls -t packages/Facebook-Plus-v*.deb | head -n1)"
           echo "Injecting ${DEB} into decrypted.ipa…"
-          # -t = tweak (.deb or .dylib), -c = ad-hoc (fake) re-sign the app so
-          # the modified binary is installable / re-signable (AltStore,
-          # Sideloadly, TrollStore, etc.).
-          cyan -i decrypted.ipa -t "$DEB" -o Facebook-Plus.ipa -c
+
+          # Absolute output path: a bare filename would land in Azule's
+          # default output folder, breaking the artifact upload.
+          "$AZULE" -i "$PWD/decrypted.ipa" -t "$PWD/$DEB" -o "$PWD/Facebook-Plus.ipa"
 
       - name: Upload patched IPA
         if: inputs.ipa_url != ''
