@@ -1,4 +1,17 @@
-name: Build IPA
+name: Build
+
+# Verify the tweak compiles on every pull request and push to main by running
+# the project's own build.sh.
+#
+# CI ships no decrypted Facebook IPA (it cannot, for legal reasons), so build.sh
+# builds the .deb and skips the cyan injection step. The check therefore verifies
+# that the package compiles cleanly; injection tooling (cyan) is not needed here.
+#
+# Optional manual runs (workflow_dispatch):
+#   Provide a direct link to a *decrypted* Facebook .ipa and the workflow will
+#   also download it, inject the freshly built tweak into it, and upload the
+#   patched IPA as an artifact. The link is fetched at run time and is never
+#   stored in the repo.
 
 on:
   pull_request:
@@ -22,7 +35,7 @@ on:
         type: string
         default: ""
 
-
+# Cancel an in-progress run when new commits are pushed to the same PR/branch.
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
@@ -30,7 +43,8 @@ concurrency:
 jobs:
   build:
     name: Build tweak (.deb)
-
+    # macOS so Theos uses Xcode's toolchain and iOS SDK directly — far more
+    # reliable than a Linux cross-compiler + downloaded SDK.
     runs-on: macos-latest
     env:
       THEOS: ${{ github.workspace }}/theos
@@ -57,11 +71,26 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      # ---------------------------------------------------------------------
+      # Optional: inject the freshly built tweak into a user-supplied
+      # decrypted IPA. Only runs on workflow_dispatch when a URL was given;
+      # push/PR runs just build the .deb.
+      # ---------------------------------------------------------------------
       - name: Install injection tool (cyan)
         if: inputs.ipa_url != ''
         run: |
-          python3 -m pip install --disable-pip-version-check cyan \
-            || python3 -m pip install --disable-pip-version-check --break-system-packages cyan
+          python3 -m pip install --disable-pip-version-check --upgrade cyan \
+            || python3 -m pip install --disable-pip-version-check --upgrade --break-system-packages cyan
+
+          # pip frequently installs console scripts outside PATH on the macOS
+          # runners (user site-packages fallback). Export those dirs for the
+          # steps that follow via $GITHUB_PATH.
+          USER_BIN="$(python3 -m site --user-base)/bin"
+          for d in "$USER_BIN" "$HOME/.local/bin" /usr/local/bin /opt/homebrew/bin; do
+            if [ -x "$d/cyan" ]; then
+              echo "$d" >> "$GITHUB_PATH"
+            fi
+          done
 
       - name: Download decrypted IPA
         if: inputs.ipa_url != ''
@@ -78,8 +107,32 @@ jobs:
       - name: Inject tweak into IPA
         if: inputs.ipa_url != ''
         run: |
+          set -euo pipefail
+
+          # Resolve the cyan executable no matter where pip dropped it.
+          if ! command -v cyan >/dev/null 2>&1; then
+            for d in \
+              "$(python3 -m site --user-base)/bin" \
+              "$HOME/.local/bin" \
+              /usr/local/bin \
+              /opt/homebrew/bin; do
+              if [ -x "$d/cyan" ]; then
+                export PATH="$d:$PATH"
+                break
+              fi
+            done
+          fi
+
+          if ! command -v cyan >/dev/null 2>&1; then
+            echo "::error::'cyan' executable not found after installation. Installed package files:"
+            python3 -m pip show -f cyan || true
+            exit 1
+          fi
+
+          echo "Using cyan at: $(command -v cyan)"
+
           # Pick the .deb that was just built (newest, in case several exist).
-          DEB=$(ls -t packages/Facebook-Plus-v*.deb | head -n1)
+          DEB="$(ls -t packages/Facebook-Plus-v*.deb | head -n1)"
           echo "Injecting ${DEB} into decrypted.ipa…"
           # -t = tweak (.deb or .dylib), -c = ad-hoc (fake) re-sign the app so
           # the modified binary is installable / re-signable (AltStore,
